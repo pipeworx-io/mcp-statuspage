@@ -3,6 +3,8 @@
 Service status / uptime MCP — "is X down right now?" answered from vendors' own
 Atlassian Statuspage feeds. Keyless.
 
+Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1476+ live data sources.
+
 Atlassian Statuspage is a de-facto standard: hundreds of vendors expose the same
 JSON contract at `https://<status-host>/api/v2/status.json`. This pack reads that
 contract, so it closes a class of question rather than one vendor.
@@ -27,7 +29,7 @@ contract, so it closes a class of question rather than one vendor.
 
 Coverage is **the curated vendor map plus any caller-supplied host.**
 
-The curated map holds **123 vendors** across AI/model providers, cloud and hosting,
+The curated map holds **190 vendors** across AI/model providers, cloud and hosting,
 databases and observability, developer tools, payments and fintech, communications,
 and business SaaS.
 
@@ -38,6 +40,12 @@ Candidates that failed were dropped rather than shipped on a hunch — status
 hostnames are genuinely unguessable (`status.anthropic.com` redirects to
 `status.claude.com`; `status.cloudflare.com` does not resolve at all, the real host
 is `www.cloudflarestatus.com`).
+
+The second wave (67 vendors, taking the map from 123 to 190) came from a coverage
+audit against a competing tracker: the bottleneck was never the host pattern, it was
+knowing which vendor NAMES to try. Given the names, 68 of 78 resolved on the first
+or second guess of the ordinary pattern, and 67 survived the three-endpoint check
+(`kong` was dropped — `status.konghq.com` answers 418 to a non-browser client).
 
 For anything outside the map, pass `status_host: "status.somevendor.com"`. Every
 response says which of the two it used via the `source` field
@@ -93,7 +101,25 @@ Add to your MCP client (Claude Desktop, Cursor, Windsurf, etc.):
 }
 ```
 
-Or connect to the full Pipeworx gateway for access to all 1422+ data sources:
+### What this endpoint actually serves
+
+`tools/list` at `https://gateway.pipeworx.io/statuspage/mcp` returns the tools in the table
+above **plus the shared Pipeworx meta-tools** — `ask_pipeworx`,
+`discover_tools`, `search_within`, `remember`/`recall` and the rest of the
+gateway-wide set. So the tool count you see is larger than this table: a
+single-pack endpoint currently lists roughly 30 shared tools alongside the
+pack's own. The connection's `initialize` response states its exact scope, and
+is the authoritative answer for a given day.
+
+This is deliberate, not multiplexing by accident. The meta-tools are what let a
+scoped connection answer a question this pack does not cover — via
+`ask_pipeworx`, which routes across the whole catalog — without you adding a
+second MCP server. There is currently no way to mount a pack endpoint without
+them; if the extra schemas cost you more context than the routing is worth,
+connect to the full gateway once rather than to several pack endpoints.
+
+Or connect to the full Pipeworx gateway to get every pack's tools listed
+directly, instead of just this one's:
 
 ```json
 {
@@ -105,9 +131,14 @@ Or connect to the full Pipeworx gateway for access to all 1422+ data sources:
 }
 ```
 
+Both URLs reach the same gateway and the same 1476+ data sources. The
+only difference is which pack's tools are listed **directly**; `ask_pipeworx`
+reaches all of them from either one.
+
 ## Using with ask_pipeworx
 
-Instead of calling tools directly, you can ask questions in plain English:
+Instead of calling tools directly, you can ask questions in plain English —
+this works on the pack endpoint above as well as on the full gateway:
 
 ```
 ask_pipeworx({ question: "your question about Statuspage data" })
@@ -117,7 +148,7 @@ The gateway picks the right tool and fills the arguments automatically.
 
 ## More
 
-- [All tools and guides](https://github.com/pipeworx-io/examples)
+- [Docs and guides](https://pipeworx.io/docs)
 - [pipeworx.io](https://pipeworx.io)
 
 ## License
