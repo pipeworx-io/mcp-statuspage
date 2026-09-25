@@ -1,6 +1,10 @@
 interface McpToolDefinition {
   name: string;
   description: string;
+  /** Human-facing one-liner (fleet #1967). Optional; consumers fall back to
+   *  description. Kept in step with shared/src/types.ts — scripts/lib/
+   *  check-inlined-types.mjs reports drift at publish time. */
+  summary?: string;
   inputSchema: {
     type: 'object';
     properties: Record<string, unknown>;
@@ -19,6 +23,93 @@ interface McpToolExport {
   cost?: Record<string, unknown>;
   provider?: string;
 }
+
+/**
+ * The class routing tokens, and the two safe ways to wrap a message carrying one.
+ *
+ * A pack signals an error's class with a leading token — `user_error:`,
+ * `upstream_down:`, `upstream_throttled:`, `not_found:`, `blocked_host:`. The
+ * gateway's classifier anchors on `^`, and `stripClassPrefix` (which hides the
+ * token from the caller) anchors on `^` too. So the convention has one failure
+ * mode, and it is silent: a catch block that wraps the message —
+ * `` `${slug}/${tool}: ${message}` `` — pushes the token off position 0. The
+ * error then books as `error` ("Pipeworx has a defect") instead of as the
+ * caller mistake it is, AND the raw token leaks into what the caller reads.
+ *
+ * Nothing about that fails loudly. The call still returns, the message still
+ * reads plausibly, and the misclassification only shows up as a pack sitting on
+ * the Problem Tools list for a bug it does not have. Found live in
+ * `medicaid-intelligence` on 2026-08-21; the same wrapper template is copied
+ * across 18 DMV packs, none of which emit a token *yet*.
+ *
+ * `scripts/check-error-class-prefix.mjs` is the gate that keeps this honest —
+ * it fails any pack that both emits a token and wraps a caught message without
+ * using one of the helpers below.
+ */
+
+/**
+ * The canonical token set. `workers/gateway/src/error-class.ts` carries its own
+ * copy on the read side (it is deliberately importable without pulling a pack
+ * in); the gate asserts the two agree, because this list has already drifted
+ * twice — `not_found:` and `blocked_host:` were honoured by the classifier and
+ * not stripped, so both went out to callers verbatim for months.
+ */
+const CLASS_TOKENS = [
+  'upstream_down',
+  'upstream_throttled',
+  'user_error',
+  'not_found',
+  'blocked_host',
+  // `blocked_url:` is emitted at position 0 from five sites in ssrf.ts
+  // (`assertPublicHttpUrl`, and every redirect hop in `safeFetch`) and was in
+  // NEITHER reader — so it went to callers verbatim for its whole life. Caught
+  // 2026-08-21 by a live n8n call, which answered a private instance_url with
+  // "…host). blocked_url: refusing to fetch non-public or non-https URL".
+  // Exactly the drift the gate now blocks.
+  'blocked_url',
+  // `auth_required:` joins the list 2026-08-29 (fleet #638). It exists for the
+  // same reason `user_error:` does: a bare 401/403 in an upstream body matches
+  // the `upstream_throttled` heuristic below before anything auth-specific, so
+  // a pack that needs to say "this is a credential problem, not a rate limit"
+  // has no wording-based route — only the explicit-prefix escape hatch works.
+  // tiingo and open-sanctions both reached for it on their own, on the
+  // (reasonable, but wrong at the time) assumption that any snake_case class
+  // already meant something to the gateway. Neither shipped a leak from
+  // MIS-CLASSIFICATION — the `error` field was already correct — the leak was
+  // the literal token riding along in `message`, unstripped, because this list
+  // didn't know the token either reader was seeing.
+  'auth_required',
+] as const;
+
+const CLASS_PREFIX_RE =
+  /^(?:upstream_down|upstream_throttled|user_error|not_found|blocked_host|blocked_url|auth_required)\s*:\s*/;
+
+/**
+ * Split a caught message into its leading routing token (possibly empty) and
+ * the human-readable body, so a wrapper can put the token back on the front.
+ *
+ *   const { token, body } = splitClassPrefix(message);
+ *   return { error: `${token}my-pack/${name}: ${body}` };
+ *
+ * The `${token}` must be the FIRST thing in the template — that is the whole
+ * point, and it is what the gate checks.
+ */
+function splitClassPrefix(message: string): { token: string; body: string } {
+  const token = message.match(CLASS_PREFIX_RE)?.[0] ?? '';
+  return { token, body: message.slice(token.length) };
+}
+
+/**
+ * Drop a leading routing token from a message that is about to become a
+ * FRAGMENT of a larger one — a per-mirror failure joined into "all providers
+ * failed (...)", say. Hoisting is wrong there: the fragment never reaches
+ * position 0, so the token cannot route anything and would only leak. The outer
+ * message declares its own class.
+ */
+function dropClassPrefix(message: string): string {
+  return message.replace(CLASS_PREFIX_RE, '');
+}
+
 
 /**
  * SSRF guard for fetching user- or registry-supplied URLs.
@@ -353,8 +444,6 @@ async function safeFetch(
     target = next;
   }
 }
-
-
 /**
  * Service status / uptime MCP — Atlassian Statuspage v2.
  *
@@ -382,13 +471,17 @@ interface Vendor {
 const VENDORS: Record<string, Vendor> = {
   '1password': { host: 'status.1password.com', name: '1Password', category: 'saas', aliases: ['onepassword', '1 password'] },
   ably: { host: 'status.ably.com', name: 'Ably', category: 'comms' },
+  acquia: { host: 'status.acquia.com', name: 'Acquia', category: 'cloud' },
+  aircall: { host: 'status.aircall.com', name: 'Aircall', category: 'comms' },
   airtable: { host: 'status.airtable.com', name: 'Airtable', category: 'saas', aliases: ['air table'] },
+  aiven: { host: 'status.aiven.io', name: 'Aiven', category: 'cloud', lite: true },
   akamai: { host: 'www.akamaistatus.com', name: 'Akamai', category: 'cloud' },
   alchemy: { host: 'status.alchemy.com', name: 'Alchemy', category: 'payments' },
   alpaca: { host: 'status.alpaca.markets', name: 'Alpaca', category: 'payments', aliases: ['alpaca markets'] },
   amplitude: { host: 'status.amplitude.com', name: 'Amplitude', category: 'data' },
   anthropic: { host: 'status.claude.com', name: 'Anthropic (Claude)', category: 'ai', aliases: ['claude', 'claude ai'] },
   assemblyai: { host: 'status.assemblyai.com', name: 'AssemblyAI', category: 'ai', aliases: ['assembly ai'] },
+  astronomer: { host: 'status.astronomer.io', name: 'Astro', category: 'devtools', lite: true },
   atlassian: { host: 'status.atlassian.com', name: 'Atlassian', category: 'devtools' },
   auth0: { host: 'auth0.statuspage.io', name: 'Auth0', category: 'saas', aliases: ['auth zero'] },
   bandwidth: { host: 'status.bandwidth.com', name: 'Bandwidth', category: 'comms' },
@@ -397,87 +490,143 @@ const VENDORS: Record<string, Vendor> = {
   bitrise: { host: 'status.bitrise.io', name: 'Bitrise', category: 'devtools' },
   box: { host: 'status.box.com', name: 'Box', category: 'saas' },
   braze: { host: 'braze.statuspage.io', name: 'Braze', category: 'comms' },
+  brevo: { host: 'status.brevo.com', name: 'Brevo', category: 'comms', lite: true },
+  browserstack: { host: 'status.browserstack.com', name: 'BrowserStack', category: 'devtools' },
+  buildkite: { host: 'buildkitestatus.com', name: 'Buildkite', category: 'devtools' },
   bunny: { host: 'status.bunny.net', name: 'bunny.net', category: 'cloud', aliases: ['bunnynet', 'bunny net', 'bunnycdn'] },
+  canva: { host: 'canvastatus.com', name: 'Canva', category: 'saas' },
   chargebee: { host: 'status.chargebee.com', name: 'Chargebee', category: 'payments', aliases: ['charge bee'] },
+  'check-point': { host: 'status.checkpoint.com', name: 'Check Point', category: 'saas' },
   circle: { host: 'status.circle.com', name: 'Circle', category: 'payments', aliases: ['circle usdc', 'usdc'] },
   circleci: { host: 'status.circleci.com', name: 'CircleCI', category: 'devtools', aliases: ['circle ci'] },
   clerk: { host: 'status.clerk.com', name: 'Clerk', category: 'saas', aliases: ['clerk dev'], lite: true },
+  clickhouse: { host: 'status.clickhouse.com', name: 'ClickHouse Cloud', category: 'data', lite: true },
+  cloudera: { host: 'status.cloudera.com', name: 'Cloudera', category: 'data' },
   cloudflare: { host: 'www.cloudflarestatus.com', name: 'Cloudflare', category: 'cloud', aliases: ['cf'] },
   cloudinary: { host: 'status.cloudinary.com', name: 'Cloudinary', category: 'cloud' },
+  cloudsmith: { host: 'status.cloudsmith.com', name: 'Cloudsmith', category: 'devtools', lite: true },
   cockroachdb: { host: 'status.cockroachlabs.cloud', name: 'CockroachDB Cloud', category: 'data', aliases: ['cockroach', 'cockroach labs'] },
+  codecov: { host: 'status.codecov.com', name: 'Codecov', category: 'devtools' },
   cohere: { host: 'status.cohere.com', name: 'Cohere', category: 'ai', lite: true },
   coinbase: { host: 'status.coinbase.com', name: 'Coinbase', category: 'payments' },
   confluence: { host: 'confluence.status.atlassian.com', name: 'Confluence', category: 'devtools' },
   confluent: { host: 'status.confluent.cloud', name: 'Confluent Cloud', category: 'data', aliases: ['kafka confluent'] },
   contentful: { host: 'www.contentfulstatus.com', name: 'Contentful', category: 'saas' },
+  couchbase: { host: 'status.couchbase.com', name: 'Couchbase Capella', category: 'data' },
   crates: { host: 'status.crates.io', name: 'Rust / crates.io', category: 'devtools', aliases: ['cratesio', 'rust crates', 'rust'] },
   cursor: { host: 'status.cursor.com', name: 'Cursor', category: 'ai', aliases: ['cursor ide'] },
   datadog: { host: 'status.datadoghq.com', name: 'Datadog (US1)', category: 'data', aliases: ['datadoghq'] },
   dbt: { host: 'status.getdbt.com', name: 'dbt Cloud', category: 'data', aliases: ['dbt cloud', 'dbt labs'], lite: true },
   deepgram: { host: 'status.deepgram.com', name: 'Deepgram', category: 'ai', aliases: ['deep gram'] },
+  dialpad: { host: 'status.dialpad.com', name: 'Dialpad', category: 'comms' },
   digitalocean: { host: 'status.digitalocean.com', name: 'DigitalOcean', category: 'cloud', aliases: ['digital ocean'] },
   discord: { host: 'discordstatus.com', name: 'Discord', category: 'comms' },
   docusign: { host: 'status.docusign.com', name: 'Docusign', category: 'saas', aliases: ['docu sign'] },
+  doppler: { host: 'status.doppler.com', name: 'Doppler', category: 'devtools' },
+  dremio: { host: 'status.dremio.com', name: 'Dremio', category: 'data' },
   dropbox: { host: 'status.dropbox.com', name: 'Dropbox', category: 'saas', aliases: ['drop box'] },
   duo: { host: 'status.duo.com', name: 'Duo Security', category: 'saas', aliases: ['duo security', 'cisco duo'] },
   elastic: { host: 'status.elastic.co', name: 'Elastic Cloud', category: 'data', aliases: ['elasticsearch', 'elastic cloud'] },
   elevenlabs: { host: 'status.elevenlabs.io', name: 'ElevenLabs', category: 'ai', aliases: ['eleven labs', '11labs'], lite: true },
+  emnify: { host: 'status.emnify.com', name: 'emnify', category: 'comms' },
   epicgames: { host: 'status.epicgames.com', name: 'Epic Games', category: 'saas', aliases: ['epic games', 'epic', 'fortnite'] },
+  eset: { host: 'status.eset.com', name: 'ESET', category: 'saas' },
   fastspring: { host: 'status.fastspring.com', name: 'FastSpring', category: 'payments', aliases: ['fast spring'] },
   figma: { host: 'status.figma.com', name: 'Figma', category: 'saas' },
   fireworks: { host: 'status.fireworks.ai', name: 'Fireworks AI', category: 'ai', aliases: ['fireworks ai'], lite: true },
   fly: { host: 'status.flyio.net', name: 'Fly.io', category: 'cloud', aliases: ['flyio', 'fly io'] },
+  frontegg: { host: 'status.frontegg.com', name: 'Frontegg', category: 'devtools' },
+  fusionauth: { host: 'status.fusionauth.io', name: 'FusionAuth', category: 'devtools' },
   'gemini-exchange': { host: 'status.gemini.com', name: 'Gemini Exchange', category: 'payments', aliases: ['gemini'] },
   github: { host: 'www.githubstatus.com', name: 'GitHub', category: 'devtools', aliases: ['gh'] },
   godaddy: { host: 'status.godaddy.com', name: 'GoDaddy', category: 'cloud', aliases: ['go daddy'] },
+  gorgias: { host: 'status.gorgias.com', name: 'Gorgias', category: 'saas' },
+  goto: { host: 'status.goto.com', name: 'GoTo', category: 'comms' },
   grafana: { host: 'status.grafana.com', name: 'Grafana Cloud', category: 'data', aliases: ['grafana cloud'] },
   groq: { host: 'groqstatus.com', name: 'Groq', category: 'ai', aliases: ['groqcloud'], lite: true },
+  harness: { host: 'status.harness.io', name: 'Harness', category: 'devtools' },
   hashicorp: { host: 'status.hashicorp.com', name: 'HashiCorp', category: 'devtools', aliases: ['terraform', 'vault', 'consul', 'nomad'], lite: true },
   heap: { host: 'status.heap.io', name: 'Heap', category: 'data' },
+  hex: { host: 'hex.statuspage.io', name: 'Hex', category: 'devtools' },
+  hologram: { host: 'status.hologram.io', name: 'Hologram', category: 'comms' },
   hubspot: { host: 'status.hubspot.com', name: 'HubSpot', category: 'saas', aliases: ['hub spot'] },
   imgix: { host: 'status.imgix.com', name: 'imgix', category: 'cloud' },
+  imperva: { host: 'status.imperva.com', name: 'Imperva', category: 'saas' },
+  incorta: { host: 'status.incorta.com', name: 'Incorta Cloud', category: 'data' },
+  influxdb: { host: 'status.influxdata.com', name: 'InfluxDB Cloud', category: 'data' },
+  infobip: { host: 'status.infobip.com', name: 'Infobip', category: 'comms' },
   infura: { host: 'status.infura.io', name: 'Infura', category: 'payments' },
   jfrog: { host: 'status.jfrog.io', name: 'JFrog Cloud', category: 'devtools', aliases: ['artifactory'] },
   jira: { host: 'jira-software.status.atlassian.com', name: 'Jira', category: 'devtools', aliases: ['jira software'] },
+  jumpcloud: { host: 'status.jumpcloud.com', name: 'JumpCloud', category: 'devtools' },
+  keeper: { host: 'keepersecurity.statuspage.io', name: 'Keeper Security', category: 'saas' },
+  kinsta: { host: 'status.kinsta.com', name: 'Kinsta', category: 'cloud' },
   klaviyo: { host: 'status.klaviyo.com', name: 'Klaviyo', category: 'comms' },
+  knowbe4: { host: 'status.knowbe4.com', name: 'KnowBe4', category: 'saas' },
   kraken: { host: 'status.kraken.com', name: 'Kraken', category: 'payments' },
   launchdarkly: { host: 'status.launchdarkly.com', name: 'LaunchDarkly', category: 'devtools', aliases: ['launch darkly'] },
   linode: { host: 'status.linode.com', name: 'Linode', category: 'cloud', aliases: ['akamai linode'] },
   loom: { host: 'loom.status.atlassian.com', name: 'Loom', category: 'devtools' },
   mailgun: { host: 'status.mailgun.com', name: 'Mailgun', category: 'comms' },
+  make: { host: 'status.make.com', name: 'Make', category: 'saas' },
   mapbox: { host: 'status.mapbox.com', name: 'Mapbox', category: 'cloud', aliases: ['map box'] },
   marqeta: { host: 'status.marqeta.com', name: 'Marqeta', category: 'payments' },
+  materialize: { host: 'status.materialize.com', name: 'Materialize', category: 'data', lite: true },
+  meraki: { host: 'status.meraki.com', name: 'Cisco Meraki', category: 'cloud' },
+  messagebird: { host: 'status.messagebird.com', name: 'Bird (MessageBird)', category: 'comms' },
+  metabase: { host: 'status.metabase.com', name: 'Metabase', category: 'data' },
   miro: { host: 'status.miro.com', name: 'Miro', category: 'saas', lite: true },
   mixpanel: { host: 'www.mixpanelstatus.com', name: 'Mixpanel', category: 'data', aliases: ['mix panel'] },
+  monday: { host: 'status.monday.com', name: 'monday.com', category: 'saas' },
   mongodb: { host: 'status.mongodb.com', name: 'MongoDB Cloud', category: 'data', aliases: ['atlas', 'mongo', 'mongodb atlas'] },
+  neo4j: { host: 'status.neo4j.io', name: 'Neo4j Aura', category: 'data' },
   netlify: { host: 'www.netlifystatus.com', name: 'Netlify', category: 'cloud' },
+  netsuite: { host: 'status.netsuite.com', name: 'NetSuite', category: 'saas' },
   newrelic: { host: 'status.newrelic.com', name: 'New Relic', category: 'data', aliases: ['new relic'] },
+  nextiva: { host: 'status.nextiva.com', name: 'Nextiva', category: 'comms' },
   ngrok: { host: 'status.ngrok.com', name: 'ngrok', category: 'cloud' },
   npm: { host: 'status.npmjs.org', name: 'npm', category: 'devtools', aliases: ['npmjs', 'node package manager'] },
   nylas: { host: 'status-v3.nylas.com', name: 'Nylas', category: 'comms' },
+  'octopus-deploy': { host: 'status.octopus.com', name: 'Octopus Deploy', category: 'devtools' },
   openai: { host: 'status.openai.com', name: 'OpenAI', category: 'ai', aliases: ['chatgpt', 'open ai', 'gpt'], lite: true },
+  openvpn: { host: 'status.openvpn.com', name: 'OpenVPN', category: 'cloud' },
   opsgenie: { host: 'opsgenie.status.atlassian.com', name: 'Opsgenie', category: 'devtools' },
   optimizely: { host: 'status.optimizely.com', name: 'Optimizely', category: 'data' },
+  'palo-alto': { host: 'status.paloaltonetworks.com', name: 'Palo Alto Networks', category: 'saas' },
   pantheon: { host: 'status.pantheon.io', name: 'Pantheon', category: 'cloud' },
   pinecone: { host: 'status.pinecone.io', name: 'Pinecone', category: 'ai', aliases: ['pine cone'] },
+  'ping-identity': { host: 'status.pingidentity.com', name: 'Ping Identity', category: 'devtools' },
   plaid: { host: 'status.plaid.com', name: 'Plaid', category: 'payments', lite: true },
   planetscale: { host: 'www.planetscalestatus.com', name: 'PlanetScale', category: 'data', aliases: ['planet scale'], lite: true },
+  plivo: { host: 'status.plivo.com', name: 'Plivo', category: 'comms' },
   postman: { host: 'status.postman.com', name: 'Postman', category: 'devtools' },
+  prefect: { host: 'status.prefect.io', name: 'Prefect', category: 'devtools', lite: true },
+  pulumi: { host: 'status.pulumi.com', name: 'Pulumi', category: 'devtools' },
   pusher: { host: 'status.pusher.com', name: 'Pusher', category: 'comms' },
   pypi: { host: 'status.python.org', name: 'Python Infrastructure (PyPI)', category: 'devtools', aliases: ['python', 'python infrastructure'] },
+  qualys: { host: 'status.qualys.com', name: 'Qualys', category: 'saas' },
   quickbooks: { host: 'status.developer.intuit.com', name: 'Intuit Developer (QuickBooks)', category: 'payments', aliases: ['intuit', 'intuit developer'] },
   quicknode: { host: 'status.quicknode.com', name: 'QuickNode', category: 'payments', aliases: ['quick node'] },
+  rapid7: { host: 'status.rapid7.com', name: 'Rapid7', category: 'saas' },
   readme: { host: 'www.readmestatus.com', name: 'ReadMe', category: 'devtools', aliases: ['readme io'] },
+  rebuy: { host: 'status.rebuyengine.com', name: 'Rebuy', category: 'saas' },
+  recharge: { host: 'status.rechargepayments.com', name: 'Recharge', category: 'saas' },
   recurly: { host: 'status.recurly.com', name: 'Recurly', category: 'payments', lite: true },
   reddit: { host: 'www.redditstatus.com', name: 'Reddit', category: 'saas' },
   render: { host: 'status.render.com', name: 'Render', category: 'cloud' },
   replicate: { host: 'www.replicatestatus.com', name: 'Replicate', category: 'ai', lite: true },
+  retool: { host: 'status.retool.com', name: 'Retool', category: 'devtools' },
   rubygems: { host: 'status.rubygems.org', name: 'RubyGems.org', category: 'devtools', aliases: ['ruby gems'] },
   sanity: { host: 'www.sanity-status.com', name: 'Sanity', category: 'saas', aliases: ['sanity io'] },
+  'sauce-labs': { host: 'status.saucelabs.com', name: 'Sauce Labs', category: 'devtools' },
+  scaleway: { host: 'status.scaleway.com', name: 'Scaleway', category: 'cloud' },
   segment: { host: 'status.segment.com', name: 'Segment', category: 'data', aliases: ['twilio segment'] },
+  semaphore: { host: 'status.semaphoreci.com', name: 'Semaphore', category: 'devtools' },
   sendgrid: { host: 'status.sendgrid.com', name: 'SendGrid', category: 'comms', aliases: ['twilio sendgrid'] },
   sentry: { host: 'status.sentry.io', name: 'Sentry', category: 'data' },
   shopify: { host: 'www.shopifystatus.com', name: 'Shopify', category: 'payments' },
+  sinch: { host: 'status.sinch.com', name: 'Sinch', category: 'comms' },
+  sisense: { host: 'status.sisense.com', name: 'Sisense Service Page', category: 'data' },
   smartsheet: { host: 'status.smartsheet.com', name: 'Smartsheet', category: 'saas' },
   snowflake: { host: 'status.snowflake.com', name: 'Snowflake', category: 'data' },
   snyk: { host: 'status.snyk.io', name: 'Snyk', category: 'devtools' },
@@ -488,19 +637,26 @@ const VENDORS: Record<string, Vendor> = {
   statuspage: { host: 'metastatuspage.com', name: 'Atlassian Statuspage', category: 'devtools', aliases: ['atlassian statuspage'] },
   supabase: { host: 'status.supabase.com', name: 'Supabase', category: 'data' },
   tailscale: { host: 'status.tailscale.com', name: 'Tailscale', category: 'cloud', aliases: ['tail scale'], lite: true },
+  telnyx: { host: 'status.telnyx.com', name: 'Telnyx', category: 'comms', lite: true },
   temporal: { host: 'status.temporal.io', name: 'Temporal Cloud', category: 'devtools', aliases: ['temporal io'] },
+  tenable: { host: 'status.tenable.com', name: 'Tenable', category: 'saas' },
   travisci: { host: 'www.traviscistatus.com', name: 'Travis CI', category: 'devtools', aliases: ['travis', 'travis ci'] },
   trello: { host: 'trello.status.atlassian.com', name: 'Trello', category: 'devtools' },
   twilio: { host: 'status.twilio.com', name: 'Twilio', category: 'comms' },
   twitch: { host: 'status.twitch.com', name: 'Twitch', category: 'saas' },
   typeform: { host: 'status.typeform.com', name: 'Typeform', category: 'saas' },
+  ubiquiti: { host: 'status.ui.com', name: 'Ubiquiti', category: 'cloud' },
   upstash: { host: 'status.upstash.com', name: 'Upstash', category: 'cloud' },
+  vanta: { host: 'status.vanta.com', name: 'Vanta', category: 'saas' },
   vercel: { host: 'www.vercel-status.com', name: 'Vercel', category: 'cloud' },
   vimeo: { host: 'www.vimeostatus.com', name: 'Vimeo', category: 'saas' },
   webflow: { host: 'status.webflow.com', name: 'Webflow', category: 'saas' },
   wise: { host: 'status.wise.com', name: 'Wise', category: 'payments', aliases: ['transferwise'] },
+  wix: { host: 'status.wix.com', name: 'Wix', category: 'saas' },
+  wiz: { host: 'status.wiz.io', name: 'Wiz', category: 'saas' },
   workos: { host: 'status.workos.com', name: 'WorkOS', category: 'saas', aliases: ['work os'] },
   xero: { host: 'status.xero.com', name: 'Xero', category: 'payments' },
+  yotpo: { host: 'status.yotpo.com', name: 'Yotpo', category: 'saas' },
   zapier: { host: 'status.zapier.com', name: 'Zapier', category: 'saas', lite: true },
   zoom: { host: 'www.zoomstatus.com', name: 'Zoom', category: 'comms' },
 };
@@ -754,7 +910,10 @@ async function getJson(host: string, path: string): Promise<any> {
     }
   } catch (e) {
     if (e instanceof Unreachable) throw e;
-    throw new Unreachable(`Could not reach https://${host}${path}: ${(e as Error).message}`);
+    // Hoist any class routing token to the front — a preamble in front of it
+    // cancels both the classifier and the caller-side stripper.
+    const { token, body } = splitClassPrefix((e as Error).message);
+    throw new Unreachable(`${token}Could not reach https://${host}${path}: ${body}`);
   } finally {
     clearTimeout(timer);
   }
@@ -887,7 +1046,7 @@ async function checkOne(t: Target, includeComponents: boolean): Promise<Record<s
     open = r.incidents;
     incidentsVia = r.via;
   } catch (e) {
-    incidentsVia = `unavailable (${(e as Error).message.slice(0, 80)})`;
+    incidentsVia = `unavailable (${dropClassPrefix((e as Error).message).slice(0, 80)})`;
   }
 
   const maint: any[] = Array.isArray(summary.scheduled_maintenances) ? summary.scheduled_maintenances : [];
