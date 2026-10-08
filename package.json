@@ -1,6 +1,6 @@
 {
   "name": "@pipeworx/mcp-statuspage",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Service status / uptime MCP — Atlassian Statuspage v2.",
   "type": "module",
   "main": "src/index.ts",
@@ -26,7 +26,7 @@
     "@cloudflare/workers-types": "^4.20260405.1"
   },
   "pipeworx": {
-    "sourceHash": "v1-e51b9db96c5536d2890ba57bd09cca130537b160a4ec747a958d9183a29f5bae",
-    "sourceCommit": "00c836ddeaecbdd581dcfb0fb1842efea104006e"
+    "sourceHash": "v1-594cff4a3ec91c9945b45f7f8cc963c61e784510ca8ef39c68ed6578764a0ab2",
+    "sourceCommit": "e369dfedd93d5fcbf521281559a146302c14e1a0"
   }
 }

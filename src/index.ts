@@ -421,8 +421,12 @@ function stripCredentials(init: RequestInit | undefined): RequestInit | undefine
 async function safeFetch(
   raw: string,
   init?: RequestInit,
-  opts?: { maxRedirects?: number },
+  opts?: { maxRedirects?: number } & SafeFetchExtendedOptions,
 ): Promise<Response> {
+  // Opt-in hardening (fleet #2729/#2847). Only a caller that passes one of the
+  // extended options takes the extended path; every existing caller passes at
+  // most `maxRedirects` and runs the original loop below, unchanged.
+  if (opts && usesExtendedOptions(opts)) return safeFetchExtended(raw, init, opts);
   const maxRedirects = opts?.maxRedirects ?? 3;
   const origin = assertPublicHttpUrl(raw).origin;
   let target = assertPublicHttpUrl(raw).toString();
@@ -442,6 +446,257 @@ async function safeFetch(
     if (!isPublicHttpUrl(next)) throw new Error('blocked_url: redirect to non-public URL');
     if (new URL(next).origin !== origin) reqInit = stripCredentials(reqInit);
     target = next;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OPT-IN HARDENING for fetching an arbitrary caller-named URL (fleet #2729,
+// docs/verbatim-fetch-design.md §3; built in #2847).
+//
+// Everything below is reached ONLY when a caller passes one of these options to
+// safeFetch. The https-only, any-port, lexical-only behaviour above is a
+// standing invariant for every existing caller and is not changed: a call with
+// no options, or with `maxRedirects` alone, never enters this code.
+//
+// What it adds, each enforced on the initial URL AND on every redirect hop:
+//   allowHttp       accept http:// as well as https:// (https→http hops too;
+//                   the caller sees them through onHop and says so)
+//   allowedPorts    refuse any explicit port not in the list
+//   refuseUserinfo  refuse `user:pass@host` — we never send credentials
+//   resolvePublic   resolve the host over DNS-over-HTTPS (A + AAAA) and refuse
+//                   if ANY answer is non-public: `10.0.0.1.nip.io` passes every
+//                   lexical check above and still points at private space
+//   denyHost        caller-supplied denylist (our own hosts, abuse complaints)
+//   onHop           observe every response in the chain (status + Location)
+//
+// Refusals throw BlockedUrlError, whose message still starts `blocked_url:` so
+// any existing catch that keys on that prefix keeps working, and which carries
+// the RULE that fired so the caller can name it.
+// ─────────────────────────────────────────────────────────────────────────────
+
+type BlockedUrlRule =
+  | 'invalid_url'
+  | 'scheme'
+  | 'userinfo'
+  | 'port'
+  | 'private_address'
+  | 'dns_private'
+  | 'denylisted_host'
+  | 'too_many_redirects'
+  | 'invalid_redirect';
+
+class BlockedUrlError extends Error {
+  readonly rule: BlockedUrlRule;
+  /** The URL (initial or redirect target) that tripped the rule. */
+  readonly url: string;
+  /** 0 = the URL the caller passed; n = the n-th redirect target. */
+  readonly hop: number;
+  constructor(rule: BlockedUrlRule, detail: string, url: string, hop: number) {
+    super(`blocked_url: ${rule}: ${detail}`);
+    this.name = 'BlockedUrlError';
+    this.rule = rule;
+    this.url = url;
+    this.hop = hop;
+  }
+}
+
+/** The host could not be resolved at all (NXDOMAIN, no A/AAAA, or the DoH lookup itself failed). Fails closed. */
+class DnsLookupError extends Error {
+  readonly kind: 'nxdomain' | 'no_address' | 'lookup_failed';
+  readonly host: string;
+  constructor(kind: DnsLookupError['kind'], host: string, detail: string) {
+    super(`dns_lookup_failed: ${kind}: ${host}: ${detail}`);
+    this.name = 'DnsLookupError';
+    this.kind = kind;
+    this.host = host;
+  }
+}
+
+interface PublicResolutionOptions {
+  /** DoH JSON endpoint. Default https://cloudflare-dns.com/dns-query */
+  endpoint?: string;
+  /** Per-lookup bound. Default 3000 ms. */
+  timeoutMs?: number;
+  /** Injected for tests; defaults to the global fetch. */
+  fetchImpl?: typeof fetch;
+}
+
+interface SafeFetchExtendedOptions {
+  allowHttp?: boolean;
+  allowedPorts?: number[];
+  refuseUserinfo?: boolean;
+  resolvePublic?: boolean | PublicResolutionOptions;
+  /** Return a reason string to refuse a host, or null to allow it. Receives the lowercased hostname. */
+  denyHost?: (hostname: string) => string | null;
+  onHop?: (hop: { url: string; status: number; location: string | null }) => void;
+}
+
+function usesExtendedOptions(o: SafeFetchExtendedOptions): boolean {
+  return (
+    o.allowHttp !== undefined ||
+    o.allowedPorts !== undefined ||
+    o.refuseUserinfo !== undefined ||
+    o.resolvePublic !== undefined ||
+    o.denyHost !== undefined ||
+    o.onHop !== undefined
+  );
+}
+
+function bareHost(u: URL): string {
+  const h = u.hostname.toLowerCase();
+  return h.startsWith('[') && h.endsWith(']') ? h.slice(1, -1) : h;
+}
+
+function isIpLiteral(host: string): boolean {
+  return parseIpv4(host) !== null || host.includes(':');
+}
+
+/** True when an address from a DNS answer is public, by the same rules as a URL literal. */
+function isPublicAddress(addr: string): boolean {
+  const a = addr.trim().toLowerCase();
+  if (!a) return false;
+  return isPublicHttpUrl(a.includes(':') ? `https://[${a}]/` : `https://${a}/`);
+}
+
+/**
+ * Lexical checks for one URL in the chain, by the opted-in rules. Returns the
+ * parsed URL or throws BlockedUrlError naming the rule.
+ */
+function checkUrlByRules(raw: string, opts: SafeFetchExtendedOptions, hop = 0): URL {
+  let u: URL;
+  try {
+    u = new URL(raw);
+  } catch {
+    throw new BlockedUrlError('invalid_url', 'not a parseable absolute URL', raw, hop);
+  }
+  const httpOk = opts.allowHttp === true && u.protocol === 'http:';
+  if (u.protocol !== 'https:' && !httpOk) {
+    throw new BlockedUrlError('scheme', `${u.protocol.replace(/:$/, '')} is not allowed (${opts.allowHttp ? 'http or https' : 'https'} only)`, raw, hop);
+  }
+  if (opts.refuseUserinfo && (u.username || u.password)) {
+    throw new BlockedUrlError('userinfo', 'URLs carrying user:password@ credentials are refused', raw, hop);
+  }
+  if (opts.allowedPorts) {
+    const port = u.port ? Number(u.port) : u.protocol === 'https:' ? 443 : 80;
+    if (!opts.allowedPorts.includes(port)) {
+      throw new BlockedUrlError('port', `port ${port} is not allowed (allowed: ${opts.allowedPorts.join(', ')})`, raw, hop);
+    }
+  }
+  // Host rules: reuse the vetted lexical guard on an https URL carrying only the host.
+  if (!isPublicHttpUrl(`https://${u.hostname}/`)) {
+    throw new BlockedUrlError('private_address', `${u.hostname} is a private, loopback, link-local, metadata or reserved address`, raw, hop);
+  }
+  if (opts.denyHost) {
+    const reason = opts.denyHost(bareHost(u));
+    if (reason) throw new BlockedUrlError('denylisted_host', reason, raw, hop);
+  }
+  return u;
+}
+
+type DohAnswer = { type?: number; data?: string; TTL?: number };
+const dnsVerdictCache = new Map<string, { addresses: string[]; expires: number }>();
+
+async function dohQuery(host: string, type: 'A' | 'AAAA', o: PublicResolutionOptions): Promise<{ status: number; answers: DohAnswer[] }> {
+  const endpoint = o.endpoint ?? 'https://cloudflare-dns.com/dns-query';
+  const f = o.fetchImpl ?? fetch;
+  let res: Response;
+  try {
+    res = await f(`${endpoint}?name=${encodeURIComponent(host)}&type=${type}`, {
+      headers: { Accept: 'application/dns-json' },
+      signal: AbortSignal.timeout(o.timeoutMs ?? 3000),
+    });
+  } catch (e) {
+    throw new DnsLookupError('lookup_failed', host, `DoH ${type} request failed: ${(e as Error).message}`);
+  }
+  if (!res.ok) throw new DnsLookupError('lookup_failed', host, `DoH ${type} returned HTTP ${res.status}`);
+  let j: { Status?: number; Answer?: DohAnswer[] };
+  try {
+    j = (await res.json()) as typeof j;
+  } catch {
+    throw new DnsLookupError('lookup_failed', host, `DoH ${type} body is not JSON`);
+  }
+  return { status: j.Status ?? -1, answers: Array.isArray(j.Answer) ? j.Answer : [] };
+}
+
+/**
+ * Resolve `host` over DNS-over-HTTPS (A and AAAA) and throw BlockedUrlError
+ * (`dns_private`) if ANY address is non-public. Throws DnsLookupError when the
+ * name does not resolve or the lookup fails — fail closed: an unverifiable
+ * host is not fetched.
+ *
+ * Residual risk, accepted in the design: the runtime resolves the name again
+ * when it connects, so a TOCTOU window remains. The backstop is that Workers
+ * egress is not a route into our infrastructure and no credential is attached.
+ *
+ * Public verdicts are cached per isolate for the record TTL (60 s minimum).
+ */
+async function assertPublicResolution(host: string, o: PublicResolutionOptions = {}, hop = 0, url = host): Promise<string[]> {
+  const h = host.toLowerCase().replace(/^\[|\]$/g, '').replace(/\.$/, '');
+  if (isIpLiteral(h)) {
+    if (!isPublicAddress(h)) throw new BlockedUrlError('dns_private', `${h} is not a public address`, url, hop);
+    return [h];
+  }
+  const hit = dnsVerdictCache.get(h);
+  if (hit && hit.expires > Date.now()) return hit.addresses;
+
+  const [a, aaaa] = await Promise.all([dohQuery(h, 'A', o), dohQuery(h, 'AAAA', o)]);
+  if (a.status === 3 && aaaa.status === 3) throw new DnsLookupError('nxdomain', h, 'the name does not exist');
+  if (a.status !== 0 && aaaa.status !== 0) {
+    throw new DnsLookupError('lookup_failed', h, `DoH status A=${a.status} AAAA=${aaaa.status}`);
+  }
+  const addrs = [...a.answers, ...aaaa.answers].filter((r) => (r.type === 1 || r.type === 28) && typeof r.data === 'string');
+  if (addrs.length === 0) throw new DnsLookupError('no_address', h, 'no A or AAAA records');
+  const bad = addrs.find((r) => !isPublicAddress(String(r.data)));
+  if (bad) {
+    throw new BlockedUrlError('dns_private', `${h} resolves to ${bad.data}, which is not a public address`, url, hop);
+  }
+  const ttl = Math.max(60, Math.min(...addrs.map((r) => (typeof r.TTL === 'number' ? r.TTL : 60))));
+  const addresses = addrs.map((r) => String(r.data));
+  dnsVerdictCache.set(h, { addresses, expires: Date.now() + ttl * 1000 });
+  return addresses;
+}
+
+/** Test seam: forget cached DNS verdicts. */
+function clearPublicResolutionCache(): void {
+  dnsVerdictCache.clear();
+}
+
+async function vetHop(raw: string, opts: SafeFetchExtendedOptions, hop: number): Promise<URL> {
+  const u = checkUrlByRules(raw, opts, hop);
+  if (opts.resolvePublic) {
+    const ro = typeof opts.resolvePublic === 'object' ? opts.resolvePublic : {};
+    await assertPublicResolution(bareHost(u), ro, hop, raw);
+  }
+  return u;
+}
+
+async function safeFetchExtended(
+  raw: string,
+  init: RequestInit | undefined,
+  opts: { maxRedirects?: number } & SafeFetchExtendedOptions,
+): Promise<Response> {
+  const maxRedirects = opts.maxRedirects ?? 3;
+  let target = await vetHop(raw, opts, 0);
+  const origin = target.origin;
+  let reqInit = init;
+  for (let hop = 0; ; hop++) {
+    const res = await fetch(target.toString(), { ...reqInit, redirect: 'manual' });
+    const location = res.status >= 300 && res.status < 400 ? res.headers.get('location') : null;
+    opts.onHop?.({ url: target.toString(), status: res.status, location });
+    if (!location) return res;
+    // Release the redirect body; we never read it.
+    try { await res.body?.cancel(); } catch { /* already consumed or not cancellable */ }
+    if (hop >= maxRedirects) {
+      throw new BlockedUrlError('too_many_redirects', `more than ${maxRedirects} redirects`, target.toString(), hop + 1);
+    }
+    let next: string;
+    try {
+      next = new URL(location, target).toString();
+    } catch {
+      throw new BlockedUrlError('invalid_redirect', `unparseable Location ${location.slice(0, 120)}`, target.toString(), hop + 1);
+    }
+    target = await vetHop(next, opts, hop + 1);
+    if (target.origin !== origin) reqInit = stripCredentials(reqInit);
   }
 }
 /**
