@@ -1,6 +1,6 @@
 {
   "name": "@pipeworx/mcp-statuspage",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Service status / uptime MCP — Atlassian Statuspage v2.",
   "type": "module",
   "main": "lib/index.js",
@@ -27,7 +27,7 @@
     "mode": "gateway",
     "slug": "statuspage",
     "gatewaySlug": "statuspage",
-    "sourceHash": "v1-7d4fe3c9f941005166064b9d776810dc622be14a5bbd150c1b98339b7750261f",
-    "sourceCommit": "f47d581679e1e887373df51ba623f891fbe4c464"
+    "sourceHash": "v1-1d016062f6bb4619e436a364f238b0a537acbb2c72ca5324b75db222ad5059cf",
+    "sourceCommit": "868e119d526d5409447b7ee2149afba7eb9d2593"
   }
 }
